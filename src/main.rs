@@ -3,6 +3,7 @@ extern crate serde_derive;
 
 mod config;
 mod tun;
+mod checksum;
 
 use std::fs::File;
 use std::io::Read;

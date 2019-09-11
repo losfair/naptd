@@ -1,10 +1,12 @@
 use crate::config::*;
+use crate::checksum;
 use tun_tap::{Iface, Mode};
 use std::sync::Arc;
-use std::net::Ipv4Addr;
-use packet::ip::v4;
+use std::net::{Ipv4Addr, Ipv6Addr};
+use packet::ip::{v4, Protocol};
 use packet::Builder;
-use byteorder::{ByteOrder, BigEndian};
+use packet::PacketMut;
+use byteorder::{ByteOrder, BigEndian, LittleEndian};
 
 const NAT_PREFIX_MASK: u128 = (!0u128) << 32;
 
@@ -31,8 +33,8 @@ impl Tun {
         let mut buf: [u8; 1500] = [0; 1500];
         loop {
             let n = self.iface.recv(&mut buf).unwrap();
-            let buf = &buf[..n];
-            match v4::Packet::new(buf) {
+            let buf = &mut buf[..n];
+            match v4::Packet::new(buf as &[u8]) {
                 Ok(pkt) => self.handle_ipv4(pkt, buf),
                 Err(_) => self.handle_ipv6(buf),
             };
@@ -53,20 +55,44 @@ impl Tun {
         out[6] = pkt.protocol().into(); // Protocol number
         out[7] = pkt.ttl(); // Hop limit
 
+        let src_addr = (u128::from(self.config.left) & NAT_PREFIX_MASK) | u32::from(pkt.source()) as u128;
+        let dst_addr = (u128::from(self.config.right) & NAT_PREFIX_MASK) | u32::from(pkt.destination()) as u128;
+
         // Source address
-        BigEndian::write_u128(&mut out[8..24], (u128::from(self.config.left) & NAT_PREFIX_MASK) | u32::from(pkt.source()) as u128);
+        BigEndian::write_u128(&mut out[8..24], src_addr);
         // Destination address
-        BigEndian::write_u128(&mut out[24..40], (u128::from(self.config.right) & NAT_PREFIX_MASK) | u32::from(pkt.destination()) as u128);
+        BigEndian::write_u128(&mut out[24..40], dst_addr);
+
+        let src_addr = Ipv6Addr::from(src_addr);
+        let dst_addr = Ipv6Addr::from(dst_addr);
 
         // Payload
         out[40..].copy_from_slice(&raw[20..]);
+
+        match pkt.protocol() {
+            Protocol::Tcp => {
+                let payload = &mut out[40..];
+                if payload.len() < 20 {
+                    return;
+                }
+
+                // Checksum inputs/outputs should all be in the "original" network byte order so using LittleEndian here.
+                {
+                    let old_checksum = LittleEndian::read_u16(&payload[16..18]);
+                    let old_hdr_cs = checksum::ipv4_pseudo_header_checksum(pkt.source(), pkt.destination(), payload.len() as u16, Protocol::Tcp.into());
+                    let new_hdr_cs = checksum::ipv6_pseudo_header_checksum(src_addr, dst_addr, payload.len() as u32, Protocol::Tcp.into());
+                    LittleEndian::write_u16(&mut payload[16..18], checksum::ip_checksum_adjust(old_checksum, old_hdr_cs, new_hdr_cs));
+                }
+            }
+            _ => {}
+        }
 
         match self.iface.send(&out) {
             _ => {}
         }
     }
 
-    fn handle_ipv6(&mut self, pkt: &[u8]) {
+    fn handle_ipv6(&mut self, pkt: &mut [u8]) {
         if pkt.len() < 40 {
             return;
         }
@@ -88,15 +114,45 @@ impl Tun {
         let right = u128::from(self.config.right);
 
         if src_addr & NAT_PREFIX_MASK == right & NAT_PREFIX_MASK && dst_addr & NAT_PREFIX_MASK == left & NAT_PREFIX_MASK {
+            let src_v6 = Ipv6Addr::from(src_addr);
+            let dst_v6 = Ipv6Addr::from(dst_addr);
             let src_addr = Ipv4Addr::from(src_addr as u32);
             let dst_addr = Ipv4Addr::from(dst_addr as u32);
-            let out = v4::Builder::default()
+
+            match Protocol::from(protocol) {
+                Protocol::Tcp => {
+                    let payload = &mut pkt[40..];
+                    if payload.len() < 20 {
+                        return;
+                    }
+
+                    // Checksum inputs/outputs should all be in the "original" network byte order so using LittleEndian here.
+                    {
+                        let old_checksum = LittleEndian::read_u16(&payload[16..18]);
+                        let old_hdr_cs = checksum::ipv6_pseudo_header_checksum(src_v6, dst_v6, payload.len() as u32, Protocol::Tcp.into());
+                        let new_hdr_cs = checksum::ipv4_pseudo_header_checksum(src_addr, dst_addr, payload.len() as u16, Protocol::Tcp.into());
+                        LittleEndian::write_u16(&mut payload[16..18], checksum::ip_checksum_adjust(old_checksum, old_hdr_cs, new_hdr_cs));
+                    }
+                }
+                _ => {}
+            }
+
+            let mut out = v4::Builder::default()
                 .ttl(hop_limit).unwrap()
                 .source(src_addr).unwrap()
                 .destination(dst_addr).unwrap()
                 .protocol(protocol.into()).unwrap()
                 .payload(&pkt[40..]).unwrap()
                 .build().unwrap();
+
+            // FIXME: Currently the `packet` crate incorrectly uses the size of the whole packet in the IHL field.
+            // This is a workaround.
+            {
+                let mut out = v4::Packet::unchecked(&mut out);
+                out.header_mut()[0] = 0x45;
+                out.update_checksum().unwrap();
+            }
+
             match self.iface.send(&out) {
                 _ => {}
             }
