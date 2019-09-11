@@ -149,7 +149,7 @@ impl Tun {
             // This is a workaround.
             {
                 let mut out = v4::Packet::unchecked(&mut out);
-                out.header_mut()[0] = 0x45;
+                out.as_mut()[0] = 0x45;
                 out.update_checksum().unwrap();
             }
 
