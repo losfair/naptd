@@ -75,14 +75,14 @@ impl Tun {
                 if payload.len() < 20 {
                     return;
                 }
-
-                // Checksum inputs/outputs should all be in the "original" network byte order so using LittleEndian here.
-                {
-                    let old_checksum = LittleEndian::read_u16(&payload[16..18]);
-                    let old_hdr_cs = checksum::ipv4_pseudo_header_checksum(pkt.source(), pkt.destination(), payload.len() as u16, Protocol::Tcp.into());
-                    let new_hdr_cs = checksum::ipv6_pseudo_header_checksum(src_addr, dst_addr, payload.len() as u32, Protocol::Tcp.into());
-                    LittleEndian::write_u16(&mut payload[16..18], checksum::ip_checksum_adjust(old_checksum, old_hdr_cs, new_hdr_cs));
+                regenerate_protocol_checksum_4to6(payload, 16, pkt.source(), pkt.destination(), src_addr, dst_addr, Protocol::Tcp);
+            }
+            Protocol::Udp => {
+                let payload = &mut out[40..];
+                if payload.len() < 8 {
+                    return;
                 }
+                regenerate_protocol_checksum_4to6(payload, 6, pkt.source(), pkt.destination(), src_addr, dst_addr, Protocol::Udp);
             }
             _ => {}
         }
@@ -125,14 +125,14 @@ impl Tun {
                     if payload.len() < 20 {
                         return;
                     }
-
-                    // Checksum inputs/outputs should all be in the "original" network byte order so using LittleEndian here.
-                    {
-                        let old_checksum = LittleEndian::read_u16(&payload[16..18]);
-                        let old_hdr_cs = checksum::ipv6_pseudo_header_checksum(src_v6, dst_v6, payload.len() as u32, Protocol::Tcp.into());
-                        let new_hdr_cs = checksum::ipv4_pseudo_header_checksum(src_addr, dst_addr, payload.len() as u16, Protocol::Tcp.into());
-                        LittleEndian::write_u16(&mut payload[16..18], checksum::ip_checksum_adjust(old_checksum, old_hdr_cs, new_hdr_cs));
+                    regenerate_protocol_checksum_6to4(payload, 16, src_v6, dst_v6, src_addr, dst_addr, Protocol::Tcp);
+                }
+                Protocol::Udp => {
+                    let payload = &mut pkt[40..];
+                    if payload.len() < 8 {
+                        return;
                     }
+                    regenerate_protocol_checksum_6to4(payload, 6, src_v6, dst_v6, src_addr, dst_addr, Protocol::Udp);
                 }
                 _ => {}
             }
@@ -158,4 +158,20 @@ impl Tun {
             }
         }
     }
+}
+
+fn regenerate_protocol_checksum_6to4(payload: &mut [u8], begin: usize, src_v6: Ipv6Addr, dst_v6: Ipv6Addr, src_v4: Ipv4Addr, dst_v4: Ipv4Addr, protocol: Protocol) {
+    // Checksum inputs/outputs should all be in the "original" network byte order so using LittleEndian here.
+    let old_checksum = LittleEndian::read_u16(&payload[begin..]);
+    let old_hdr_cs = checksum::ipv6_pseudo_header_checksum(src_v6, dst_v6, payload.len() as u32, protocol.into());
+    let new_hdr_cs = checksum::ipv4_pseudo_header_checksum(src_v4, dst_v4, payload.len() as u16, protocol.into());
+    LittleEndian::write_u16(&mut payload[begin..], checksum::ip_checksum_adjust(old_checksum, old_hdr_cs, new_hdr_cs));
+}
+
+fn regenerate_protocol_checksum_4to6(payload: &mut [u8], begin: usize, src_v4: Ipv4Addr, dst_v4: Ipv4Addr, src_v6: Ipv6Addr, dst_v6: Ipv6Addr, protocol: Protocol) {
+    // Checksum inputs/outputs should all be in the "original" network byte order so using LittleEndian here.
+    let old_checksum = LittleEndian::read_u16(&payload[begin..]);
+    let old_hdr_cs = checksum::ipv4_pseudo_header_checksum(src_v4, dst_v4, payload.len() as u16, protocol.into());
+    let new_hdr_cs = checksum::ipv6_pseudo_header_checksum(src_v6, dst_v6, payload.len() as u32, protocol.into());
+    LittleEndian::write_u16(&mut payload[begin..], checksum::ip_checksum_adjust(old_checksum, old_hdr_cs, new_hdr_cs));
 }
